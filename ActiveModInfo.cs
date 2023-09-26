@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace ModLoaderLib
 {
-    public struct ActiveModInfo
+    public class ActiveModInfo
     {
         public ModInfo info;
         public string path;
