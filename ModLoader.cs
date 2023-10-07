@@ -1,98 +1,43 @@
 ﻿using Microsoft.VisualBasic;
 using Stride.Core;
+using Stride.Core.Extensions;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 
 namespace ModLoaderLib
 {
     public static class ModLoader
     {
-        public static string ModFolder;
+        public static string ModFolderPath;
         public static IServiceRegistry Services;
-        public static Dictionary<string, ActiveModInfo> ActiveModlist;
+        public static Dictionary<string, ActiveModInfo> AllModlist;
+        public static HashSet<string> EnabledMods;
+        public static List<string> OrderedList;
 
         public static void Initialize(string modFolder, IServiceRegistry services)
         {
             Services = services;
-            ModFolder = modFolder;
-            ActiveModlist = new Dictionary<string, ActiveModInfo>();
+            ModFolderPath = modFolder;
+            AllModlist = new Dictionary<string, ActiveModInfo>();
+            EnabledMods = new HashSet<string>();
+            OrderedList = new List<string>();
             LoadAndValidateModlist();
-        }
-
-        public static void DisableMod(ActiveModInfo actinf)
-        {
-            foreach(var kvp in ActiveModlist)
-            {
-                foreach(ModRelation rel in kvp.Value.info.relations)
-                {
-                    if(rel.internalID == actinf.info.internalID && rel.relationType == ModRelationType.required)
-                    {
-                        kvp.Value.enabled = false;
-                    }
-                }
-            }
-            actinf.enabled = false;
-        }
-        
-        public static bool AttemptEnableMod(ActiveModInfo actinf)
-        {
-            foreach(ModRelation rel in actinf.info.relations)
-            {
-                if(rel.relationType == ModRelationType.incompatible && ActiveModlist[rel.internalID].enabled)
-                {
-                    //incompatible mod enabled
-                    return false;
-                }
-
-                if (rel.relationType == ModRelationType.required && !ActiveModlist[rel.internalID].enabled)
-                {
-                    if (!AttemptEnableMod(ActiveModlist[rel.internalID]))
-                    {
-                        //couldnt enable a dependency
-                        return false;
-                    }
-                }
-            }
-            return true;
-        }
-
-        public void AttemptLoadMods()
-        {
-            HashSet<ActiveModInfo> toLoad = new HashSet<ActiveModInfo>();
-            
-            foreach(KeyValuePair<string, ActiveModInfo> kvp in ActiveModlist)
-            {
-                if (kvp.Value.enabled)
-                {
-                    toLoad.Add(kvp.Value);
-                }
-            }
-
-            foreach(ActiveModInfo modinf in toLoad)
-            {
-                AttemptLoadMod(modinf);
-            }
-        }
-
-        public static bool AttempLoadMod(ActiveModInfo modinf)
-        {
-            //see if matching version dependencies
-        }
-
-        public static bool IsModLoaded(string modid)
-        {
-            if (!ActiveModlist.TryGetValue(modid, out ActiveModInfo? modinfo))
-                return false;
-            return modinfo == null ? false : modinfo.loaded;
         }
 
         public static void LoadAndValidateModlist()
         {
-            Dictionary<string, bool>? foundList = JsonSerializer.Deserialize<Dictionary<string, bool>>(File.ReadAllText(ModFolder + "modlist"));
-            Dictionary<string, bool> uFoundList = foundList ?? new Dictionary<string, bool>();
+            List<string>? foundEnabledList = JsonSerializer.Deserialize<List<string>>(File.ReadAllText(ModFolderPath + "modlist"));
 
-            string[] modDirectories = Directory.GetDirectories(ModFolder);
+            if(foundEnabledList == null)
+            {
+                foundEnabledList = new List<string>();
+                SaveEnabledModlist(); //maybe not needed
+            }
+
+            string[] modDirectories = Directory.GetDirectories(ModFolderPath);
             foreach (string dir in modDirectories)
             {
                 ModInfo currentInfo;
@@ -102,24 +47,135 @@ namespace ModLoaderLib
                 }
                 catch (FileNotFoundException)
                 {
+                    //mod info not found in folder?
                     continue;
                 }
 
-                bool found = uFoundList.TryGetValue(currentInfo.displayName, out bool enabled);
 
-                ActiveModInfo activeInf = new ActiveModInfo(currentInfo, dir, found && enabled, false);
-                ActiveModlist.Add(activeInf.info.internalID, activeInf);
+                ActiveModInfo activeInfo = new ActiveModInfo(currentInfo, dir, false);
+                string acid = activeInfo.uniqueID;
+                AllModlist.Add(acid, activeInfo);
+            }
+            for(int i = 0; i < foundEnabledList.Count; i++)
+            {
+                string acid = foundEnabledList[i];
+                if(AllModlist.ContainsKey(acid))
+                {
+                    EnabledMods.Add(acid);
+                    OrderedList.Add(acid);
+                }
+            }
+            RecalculateAllModStates();
+        }
+
+        public static void AddModToEnabledList(string modID)
+        {
+            if (!AllModlist.ContainsKey(modID)) return;
+            if (EnabledMods.Contains(modID)) return;
+            ActiveModInfo actInf = AllModlist[modID];
+            string acid = actInf.uniqueID;
+            EnabledMods.Add(acid);
+            OrderedList.Add(acid);
+            RecalculateAllModStates();
+        }
+
+        public static void RemoveModFromEnabledList(string modID)
+        {
+            if (!AllModlist.ContainsKey(modID)) return;
+            if (!EnabledMods.Contains(modID)) return;
+            ActiveModInfo actInf = AllModlist[modID];
+            string acid = actInf.uniqueID;
+            EnabledMods.Remove(acid);
+            OrderedList.Remove(acid);
+            RecalculateAllModStates();
+        }
+
+        //moves a mod to below this index.
+        public static void MoveEnabledMod(string modID, int index, bool above)
+        {
+            if (!AllModlist.ContainsKey(modID)) return;
+            if (!EnabledMods.Contains(modID)) return;
+            ActiveModInfo actInf = AllModlist[modID];
+            string acid = actInf.uniqueID;
+            int currentIndex = OrderedList.IndexOf(modID);
+            if (currentIndex == index) return;
+            OrderedList.Insert(above ? index : index - 1, acid);
+            OrderedList.RemoveAt(currentIndex);
+            RecalculateAllModStates();
+        }
+
+        //should this be called all the time?
+        public static void RecalculateAllModStates()
+        {
+            //computer inverse mod relationship mapping (why did I do this?)
+            Dictionary<string, HashSet<string>> inverseRelationMap = new Dictionary<string, HashSet<string>>();
+            foreach(string modID in AllModlist.Keys)
+            {
+                ActiveModInfo actInf = AllModlist[modID];
+                foreach(ModRelation rel in actInf.relations)
+                {
+                    if (!inverseRelationMap.ContainsKey(rel.uniqueID))
+                        inverseRelationMap[rel.uniqueID] = new HashSet<string>();
+                    inverseRelationMap[rel.uniqueID].Add(modID);
+                }
+            }
+
+            //set state of each active mod info
+            foreach (string modID in AllModlist.Keys)
+            {
+                ComputeState(AllModlist[modID]);
             }
         }
 
+        public static ModPreLoadState ComputeState(ActiveModInfo modInfo)
+        {
+            int maxError = 0;
+            modInfo.problems = new List<string>();
+            modInfo.problemState = 0;
+            foreach (ModRelation rel in modInfo.relations)
+            {
+                switch (rel.relationType)
+                {
+                    case ModRelationType.incompatible:
+                        if (EnabledMods.Contains(rel.uniqueID))
+                        {
+                            maxError = Math.Max(maxError, 3);
+                            modInfo.problems.Add("");
+                        }
+                        break;
+                    case ModRelationType.required:
+                        if (!EnabledMods.Contains(rel.uniqueID))
+                        {
+                            maxError = Math.Max(maxError, 3);
+                            modInfo.problems.Add("");
+                        }
+                        break;
+                    case ModRelationType.optional:
+                        if (EnabledMods.Contains(rel.uniqueID))
+                        {
+
+                        }
+                        break;
+                }
+            }
+
+            return ModPreLoadState.fine;
+        }
+
+        //saved modlist. assumes queue is sorted
         public static void SaveEnabledModlist()
         {
-            Dictionary<string, bool> outputModlist = new Dictionary<string, bool>();
-            foreach(KeyValuePair<string, ActiveModInfo> kvp in ActiveModlist)
+            Queue<string> outputModlist = new Queue<string>();
+            foreach (KeyValuePair<string, ActiveModInfo> kvp in EnabledModlist)
             {
-                outputModlist.Add(kvp.Key, kvp.Value.enabled);
+                outputModlist.Enqueue(kvp.Key);
             }
-            File.WriteAllText(ModFolder + "modlist", JsonSerializer.Serialize(outputModlist));
+            File.WriteAllText(ModFolderPath + "modlist", JsonSerializer.Serialize(outputModlist));
+        }
+
+        public static bool ModIsEnabled(string modID)
+        {
+            return EnabledModlist.ContainsKey(modID);
         }
     }
 }

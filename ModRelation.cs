@@ -11,7 +11,7 @@
     {
 
         public ModRelationType relationType;
-        public string internalID;
+        public string uniqueID;
         public string version;
     }
 }
